@@ -16,7 +16,9 @@ class SaveImageWebsocket:
     @classmethod
     def INPUT_TYPES(s):
         return {"required":
-                    {"images": ("IMAGE", ),}
+                    {
+                        "images": ("IMAGE", ),
+                    }
                 }
 
     RETURN_TYPES = ()
