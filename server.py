@@ -30,6 +30,7 @@ from app.frontend_management import FrontendManager
 from app.user_manager import UserManager
 from model_filemanager import download_model, DownloadModelStatus
 from typing import Optional
+from threading import Lock
 
 class BinaryEventTypes:
     PREVIEW_IMAGE = 1
@@ -87,6 +88,8 @@ class PromptServer():
         max_upload_size = round(args.max_upload_size * 1024 * 1024)
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
+        self.sse_clients = dict()
+        self.sse_clients_lock = Lock()
         self.web_root = (
             FrontendManager.init_frontend(args.front_end_version)
             if args.front_end_root is None
@@ -99,6 +102,70 @@ class PromptServer():
         self.client_id = None
 
         self.on_prompt_handlers = []
+
+        @routes.get('/sse')
+        async def sse_handler(request):
+            response = web.StreamResponse(
+                status=200,
+                reason='OK',
+                headers={
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                }
+            )
+            await response.prepare(request)
+        
+            sid = request.rel_url.query.get('clientId', '')
+            if not sid:
+                sid = uuid.uuid4().hex  # Generate unique ID if not provided
+        
+            print(f"Client ID: {sid}")
+        
+            # Send the current queue status using self.get_queue_info()
+            initial_status = self.get_queue_info()
+            await response.write(f"event: status\ndata: {json.dumps({'status': initial_status, 'sid': sid})}\n\n".encode())
+        
+            # Store the SSE connection
+            with self.sse_clients_lock:
+                self.sse_clients[sid] = response 
+        
+            try:
+                # Send the current node if this client is executing
+                if self.client_id == sid and self.last_node_id is not None:
+                    await response.write(f"event: executing\ndata: {json.dumps({'node': self.last_node_id})}\n\n".encode())
+        
+                while True:
+                    # Periodic queue updates
+                    queue_update = self.get_queue_info()
+                    if queue_update:
+                        print(f"Client {sid} - self.client_id: {self.client_id}, Last node id: {self.last_node_id}")
+                        try:
+                            await response.write(f"event: update\ndata: {json.dumps(queue_update)}\n\n".encode())
+                        except (ConnectionResetError, aiohttp.ClientError) as e:
+                            # Handle client disconnection or network error
+                            print(f"Client {sid} disconnected abruptly. Error: {e}")
+                            break  # Exit the loop and trigger cleanup
+                        except Exception as e:
+                            # Handle any other unexpected errors
+                            print(f"Unexpected error with client {sid}: {e}")
+                            break
+                    await asyncio.sleep(1)  # Adjust the interval as needed
+        
+            finally:
+                # Cleanup after the loop exits
+                with self.sse_clients_lock:
+                    self.sse_clients.pop(sid, None)  # Remove the client from active SSE clients
+        
+                try:
+                    await response.write_eof()  # Finalize the SSE response
+                except Exception as e:
+                    # Log if the connection has already been closed and cannot be finalized
+                    print(f"Error finalizing SSE connection for {sid}: {e}")
+        
+            print(f"Connection closed and cleaned up for client {sid}.")
+            return response
+
 
         @routes.get('/ws')
         async def websocket_handler(request):
@@ -703,6 +770,13 @@ class PromptServer():
         self.loop.call_soon_threadsafe(
             self.messages.put_nowait, (event, data, sid))
 
+    async def send_sse_message(self, response, event_type, data):
+        try:
+            message = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            await response.write(message.encode())
+        except Exception as e:
+            print(f"Error sending {event_type} to SSE client: {e}")
+    
     def queue_updated(self):
         self.send_sync("status", { "status": self.get_queue_info() })
 
